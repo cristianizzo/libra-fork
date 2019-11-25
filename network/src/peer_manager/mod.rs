@@ -16,11 +16,13 @@ use crate::{common::NegotiatedSubstream, counters, protocols::identity::Identity
 use channel;
 use futures::{
     channel::oneshot,
-    future::{BoxFuture, FutureExt, TryFutureExt},
+    future::{BoxFuture, FutureExt},
     sink::SinkExt,
     stream::{Fuse, FuturesUnordered, StreamExt},
 };
-use logger::prelude::*;
+use libra_config::config::RoleType;
+use libra_logger::prelude::*;
+use libra_types::PeerId;
 use netcore::{
     multiplexing::StreamMultiplexer,
     negotiate::{negotiate_inbound, negotiate_outbound_interactive, negotiate_outbound_select},
@@ -29,7 +31,6 @@ use netcore::{
 use parity_multiaddr::Multiaddr;
 use std::{collections::HashMap, marker::PhantomData};
 use tokio::runtime::TaskExecutor;
-use types::PeerId;
 
 mod error;
 #[cfg(test)]
@@ -111,10 +112,10 @@ impl<TSubstream> PeerManagerRequestSender<TSubstream> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
         let request = PeerManagerRequest::OpenSubstream(peer_id, protocol, oneshot_tx);
         self.inner.send(request).await.unwrap();
-        // TODO(philiphayes): If this error changes, also change rpc errors to
-        // handle appropriate cases.
         oneshot_rx
             .await
+            // The open_substream request can get dropped/canceled if the peer
+            // connection is in the process of shutting down.
             .map_err(|_| PeerManagerError::NotConnected(peer_id))?
     }
 }
@@ -132,7 +133,7 @@ where
 {
     NewConnection(Identity, Multiaddr, ConnectionOrigin, TMuxer),
     NewSubstream(PeerId, NegotiatedSubstream<TMuxer::Substream>),
-    PeerDisconnected(PeerId, ConnectionOrigin, DisconnectReason),
+    PeerDisconnected(PeerId, RoleType, ConnectionOrigin, DisconnectReason),
 }
 
 /// Responsible for handling and maintaining connections to other Peers
@@ -174,8 +175,6 @@ where
 impl<TTransport, TMuxer> PeerManager<TTransport, TMuxer>
 where
     TTransport: Transport<Output = (Identity, TMuxer)> + Send + 'static,
-    TTransport::Listener: 'static,
-    TTransport::Inbound: 'static,
     TMuxer: StreamMultiplexer + 'static,
 {
     /// Construct a new PeerManager actor
@@ -262,7 +261,7 @@ where
                 let event = PeerManagerNotification::NewInboundSubstream(peer_id, substream);
                 ch.send(event).await.unwrap();
             }
-            InternalEvent::PeerDisconnected(peer_id, origin, _reason) => {
+            InternalEvent::PeerDisconnected(peer_id, role, origin, _reason) => {
                 let peer = self
                     .active_peers
                     .remove(&peer_id)
@@ -282,6 +281,10 @@ where
                         error!("oneshot channel receiver dropped");
                     }
                 }
+                // update libra_network_peer counter
+                counters::LIBRA_NETWORK_PEERS
+                    .with_label_values(&[&role.to_string(), "connected"])
+                    .dec();
                 // Send LostPeer notifications to subscribers
                 for ch in &mut self.peer_event_handlers {
                     ch.send(PeerManagerNotification::LostPeer(
@@ -351,9 +354,11 @@ where
     }
 
     fn start_connection_listener(&mut self) {
-        let connection_handler = self.connection_handler.take().unwrap();
-        self.executor
-            .spawn(connection_handler.listen().boxed().unit_error().compat());
+        let connection_handler = self
+            .connection_handler
+            .take()
+            .expect("Connection handler already taken");
+        self.executor.spawn(connection_handler.listen());
     }
 
     /// In the event two peers simultaneously dial each other we need to be able to do
@@ -387,7 +392,8 @@ where
         connection: TMuxer,
     ) {
         let peer_id = identity.peer_id();
-        assert!(self.own_peer_id != peer_id);
+        let role = identity.role();
+        assert_ne!(self.own_peer_id, peer_id);
 
         let mut send_new_peer_notification = true;
 
@@ -445,10 +451,14 @@ where
             peer_id.short_str()
         );
         self.active_peers.insert(peer_id, peer_handle);
-        self.executor
-            .spawn(peer.start().boxed().unit_error().compat());
-
+        self.executor.spawn(peer.start());
+        // Send NewPeer notifications to subscribers
         if send_new_peer_notification {
+            // update libra_network_peer counter
+            counters::LIBRA_NETWORK_PEERS
+                .with_label_values(&[&role.to_string(), "connected"])
+                .inc();
+
             for ch in &mut self.peer_event_handlers {
                 ch.send(PeerManagerNotification::NewPeer(peer_id, address.clone()))
                     .await
@@ -489,6 +499,7 @@ where
     }
 }
 
+#[derive(Debug)]
 enum ConnectionHandlerRequest {
     DialPeer(
         PeerId,
@@ -524,7 +535,9 @@ where
         dial_request_rx: channel::Receiver<ConnectionHandlerRequest>,
         internal_event_tx: channel::Sender<InternalEvent<TMuxer>>,
     ) -> (Self, Multiaddr) {
-        let (listener, listen_addr) = transport.listen_on(listen_addr).unwrap();
+        let (listener, listen_addr) = transport
+            .listen_on(listen_addr)
+            .expect("Transport listen on fails");
         debug!("listening on {:?}", listen_addr);
 
         (
@@ -1038,6 +1051,7 @@ where
         self.internal_event_tx
             .send(InternalEvent::PeerDisconnected(
                 self.identity.peer_id(),
+                self.identity.role(),
                 self.origin,
                 reason,
             ))

@@ -6,21 +6,19 @@ use crate::{
         DisconnectReason, InternalEvent, Peer, PeerHandle, PeerManager, PeerManagerNotification,
         PeerManagerRequest,
     },
-    protocols::{
-        identity::{exchange_identity, Identity},
-        peer_id_exchange::PeerIdExchange,
-    },
+    protocols::identity::{exchange_identity, Identity},
     ProtocolId,
 };
 use channel;
 use futures::{
     channel::oneshot,
-    compat::Compat01As03,
     executor::block_on,
-    future::{join, FutureExt, TryFutureExt},
+    future::join,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     stream::StreamExt,
 };
+use libra_config::config::RoleType;
+use libra_types::PeerId;
 use memsocket::MemorySocket;
 use netcore::{
     multiplexing::{
@@ -33,32 +31,26 @@ use netcore::{
 use parity_multiaddr::Multiaddr;
 use std::{collections::HashMap, io, time::Duration};
 use tokio::{runtime::TaskExecutor, timer::Timeout};
-use types::PeerId;
 
 const HELLO_PROTOCOL: &[u8] = b"/hello-world/1.0.0";
 
 // Builds a concrete typed transport (instead of using impl Trait) for testing PeerManager.
 // Specifically this transport is compatible with the `build_test_connection` test helper making
 // it easy to build connections without going through the whole transport pipeline.
-fn build_test_transport(
-    own_peer_id: PeerId,
-) -> BoxedTransport<(Identity, Yamux<MemorySocket>), std::io::Error> {
+pub fn build_test_transport(
+    own_identity: Identity,
+) -> BoxedTransport<(Identity, Yamux<MemorySocket>), impl ::std::error::Error> {
     let memory_transport = MemoryTransport::default();
-    let peer_id_exchange_config = PeerIdExchange::new(own_peer_id);
-    let own_identity = Identity::new(own_peer_id, Vec::new());
-
     memory_transport
-        .and_then(move |socket, origin| peer_id_exchange_config.exchange_peer_id(socket, origin))
-        .and_then(|(peer_id, socket), origin| {
+        .and_then(|socket, origin| {
             async move {
                 let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
+                Ok(muxer)
             }
         })
-        .and_then(move |(peer_id, muxer), origin| {
+        .and_then(move |muxer, origin| {
             async move {
                 let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                assert_eq!(identity.peer_id(), peer_id);
 
                 Ok((identity, muxer))
             }
@@ -76,7 +68,7 @@ fn build_test_connection() -> (Yamux<MemorySocket>, Yamux<MemorySocket>) {
 }
 
 fn build_test_identity(peer_id: PeerId) -> Identity {
-    Identity::new(peer_id, Vec::new())
+    Identity::new(peer_id, Vec::new(), RoleType::Validator)
 }
 
 fn build_test_peer(
@@ -174,7 +166,7 @@ fn peer_open_substream() {
 // we won't deadlock.
 #[test]
 fn peer_open_substream_simultaneous() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
     let (
         (peer_a, mut peer_handle_a, mut internal_event_rx_a),
         (peer_b, mut peer_handle_b, mut internal_event_rx_b),
@@ -193,14 +185,8 @@ fn peer_open_substream_simultaneous() {
             .await;
 
         // These both should complete, but in the event they deadlock wrap them in a timeout
-        let timeout_a = Compat01As03::new(Timeout::new(
-            substream_rx_a.boxed().compat(),
-            Duration::from_secs(10),
-        ));
-        let timeout_b = Compat01As03::new(Timeout::new(
-            substream_rx_b.boxed().compat(),
-            Duration::from_secs(10),
-        ));
+        let timeout_a = Timeout::new(substream_rx_a, Duration::from_secs(10));
+        let timeout_b = Timeout::new(substream_rx_b, Duration::from_secs(10));
         let _ = timeout_a.await.unwrap().unwrap();
         let _ = timeout_b.await.unwrap().unwrap();
 
@@ -214,24 +200,25 @@ fn peer_open_substream_simultaneous() {
         // Check that we received both shutdown events
         assert_peer_disconnected_event(
             peer_handle_a.peer_id,
+            RoleType::Validator,
             DisconnectReason::Requested,
             &mut internal_event_rx_a,
         )
         .await;
         assert_peer_disconnected_event(
             peer_handle_b.peer_id,
+            RoleType::Validator,
             DisconnectReason::ConnectionLost,
             &mut internal_event_rx_b,
         )
         .await;
     };
 
-    runtime.spawn(peer_a.start().boxed().unit_error().compat());
-    runtime.spawn(peer_b.start().boxed().unit_error().compat());
+    runtime.spawn(peer_a.start());
+    runtime.spawn(peer_b.start());
 
-    runtime
-        .block_on_all(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
+    runtime.shutdown_on_idle();
 }
 
 #[test]
@@ -243,6 +230,7 @@ fn peer_disconnect_request() {
         peer_handle.disconnect().await;
         assert_peer_disconnected_event(
             peer_handle.peer_id,
+            RoleType::Validator,
             DisconnectReason::Requested,
             &mut internal_event_rx,
         )
@@ -261,6 +249,7 @@ fn peer_disconnect_connection_lost() {
         connection.close().await.unwrap();
         assert_peer_disconnected_event(
             peer_handle.peer_id,
+            RoleType::Validator,
             DisconnectReason::ConnectionLost,
             &mut internal_event_rx,
         )
@@ -297,7 +286,7 @@ fn build_test_peer_manager(
     peer_id: PeerId,
 ) -> (
     PeerManager<
-        BoxedTransport<(Identity, Yamux<MemorySocket>), std::io::Error>,
+        BoxedTransport<(Identity, Yamux<MemorySocket>), impl std::error::Error>,
         Yamux<MemorySocket>,
     >,
     channel::Sender<PeerManagerRequest<impl AsyncRead + AsyncWrite>>,
@@ -310,7 +299,7 @@ fn build_test_peer_manager(
     protocol_handlers.insert(protocol.clone(), hello_tx);
 
     let peer_manager = PeerManager::new(
-        build_test_transport(peer_id),
+        build_test_transport(Identity::new(peer_id, vec![], RoleType::Validator)),
         executor.clone(),
         peer_id,
         "/memory/0".parse().unwrap(),
@@ -344,12 +333,19 @@ async fn assert_new_substream_event<TMuxer: StreamMultiplexer>(
 
 async fn assert_peer_disconnected_event<TMuxer: StreamMultiplexer>(
     peer_id: PeerId,
+    role: RoleType,
     reason: DisconnectReason,
     internal_event_rx: &mut channel::Receiver<InternalEvent<TMuxer>>,
 ) {
     match internal_event_rx.next().await {
-        Some(InternalEvent::PeerDisconnected(actual_peer_id, _origin, actual_reason)) => {
+        Some(InternalEvent::PeerDisconnected(
+            actual_peer_id,
+            actual_role,
+            _origin,
+            actual_reason,
+        )) => {
             assert_eq!(actual_peer_id, peer_id);
+            assert_eq!(actual_role, role);
             assert_eq!(actual_reason, reason);
         }
         event => {
@@ -368,6 +364,7 @@ async fn check_correct_connection_is_live<TMuxer: StreamMultiplexer>(
     live_connection: TMuxer,
     dropped_connection: TMuxer,
     expected_peer_id: PeerId,
+    expected_role: RoleType,
     requested_shutdown: bool,
     mut internal_event_rx: &mut channel::Receiver<InternalEvent<TMuxer>>,
 ) {
@@ -376,6 +373,7 @@ async fn check_correct_connection_is_live<TMuxer: StreamMultiplexer>(
     if requested_shutdown {
         assert_peer_disconnected_event(
             expected_peer_id,
+            expected_role,
             DisconnectReason::Requested,
             &mut internal_event_rx,
         )
@@ -392,6 +390,7 @@ async fn check_correct_connection_is_live<TMuxer: StreamMultiplexer>(
 
     assert_peer_disconnected_event(
         expected_peer_id,
+        expected_role,
         DisconnectReason::ConnectionLost,
         &mut internal_event_rx,
     )
@@ -400,10 +399,11 @@ async fn check_correct_connection_is_live<TMuxer: StreamMultiplexer>(
 
 #[test]
 fn peer_manager_simultaneous_dial_two_inbound() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
+    let role = RoleType::Validator;
     let (mut peer_manager, _request_tx, _hello_rx) =
         build_test_peer_manager(runtime.executor(), ids[1]);
 
@@ -435,23 +435,23 @@ fn peer_manager_simultaneous_dial_two_inbound() {
             outbound1,
             outbound2,
             ids[0],
+            role,
             false,
             &mut peer_manager.internal_event_rx,
         )
         .await;
     };
 
-    runtime
-        .block_on(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
 }
 
 #[test]
 fn peer_manager_simultaneous_dial_inbound_outbout_remote_id_larger() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
+    let role = RoleType::Validator;
     let (mut peer_manager, _request_tx, _hello_rx) =
         build_test_peer_manager(runtime.executor(), ids[0]);
 
@@ -484,23 +484,23 @@ fn peer_manager_simultaneous_dial_inbound_outbout_remote_id_larger() {
             outbound1,
             inbound2,
             ids[1],
+            role,
             false,
             &mut peer_manager.internal_event_rx,
         )
         .await;
     };
 
-    runtime
-        .block_on(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
 }
 
 #[test]
 fn peer_manager_simultaneous_dial_inbound_outbout_own_id_larger() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
+    let role = RoleType::Validator;
     let (mut peer_manager, _request_tx, _hello_rx) =
         build_test_peer_manager(runtime.executor(), ids[1]);
 
@@ -533,23 +533,23 @@ fn peer_manager_simultaneous_dial_inbound_outbout_own_id_larger() {
             inbound2,
             outbound1,
             ids[0],
+            role,
             true,
             &mut peer_manager.internal_event_rx,
         )
         .await;
     };
 
-    runtime
-        .block_on(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
 }
 
 #[test]
 fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
+    let role = RoleType::Validator;
     let (mut peer_manager, _request_tx, _hello_rx) =
         build_test_peer_manager(runtime.executor(), ids[0]);
 
@@ -582,23 +582,23 @@ fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
             outbound2,
             inbound1,
             ids[1],
+            role,
             true,
             &mut peer_manager.internal_event_rx,
         )
         .await;
     };
 
-    runtime
-        .block_on(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
 }
 
 #[test]
 fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
+    let role = RoleType::Validator;
     let (mut peer_manager, _request_tx, _hello_rx) =
         build_test_peer_manager(runtime.executor(), ids[1]);
 
@@ -631,23 +631,23 @@ fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
             inbound1,
             outbound2,
             ids[0],
+            role,
             false,
             &mut peer_manager.internal_event_rx,
         )
         .await;
     };
 
-    runtime
-        .block_on(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
 }
 
 #[test]
 fn peer_manager_simultaneous_dial_two_outbound() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
+    let role = RoleType::Validator;
     let (mut peer_manager, _request_tx, _hello_rx) =
         build_test_peer_manager(runtime.executor(), ids[1]);
 
@@ -679,23 +679,23 @@ fn peer_manager_simultaneous_dial_two_outbound() {
             inbound1,
             inbound2,
             ids[0],
+            role,
             false,
             &mut peer_manager.internal_event_rx,
         )
         .await;
     };
 
-    runtime
-        .block_on(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
 }
 
 #[test]
 fn peer_manager_simultaneous_dial_disconnect_event() {
-    let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+    let runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
+    let role = RoleType::Validator;
     let (mut peer_manager, _request_tx, _hello_rx) =
         build_test_peer_manager(runtime.executor(), ids[1]);
 
@@ -715,6 +715,7 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
         // removed from PeerManager
         let event = InternalEvent::PeerDisconnected(
             ids[0],
+            role,
             ConnectionOrigin::Inbound,
             DisconnectReason::ConnectionLost,
         );
@@ -723,7 +724,5 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
         assert!(peer_manager.active_peers.contains_key(&ids[0]));
     };
 
-    runtime
-        .block_on(test.boxed().unit_error().compat())
-        .unwrap();
+    runtime.block_on(test);
 }
